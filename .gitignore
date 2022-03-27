@@ -1,0 +1,6 @@
+#Doc Files
+*.xlsx
+*.csv
+
+#Enviroment Files
+.env
