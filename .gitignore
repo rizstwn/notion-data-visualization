@@ -1,6 +1,8 @@
 #Doc Files
 *.xlsx
 *.csv
+__pycache__
 
 #Enviroment Files
 .env
+venv

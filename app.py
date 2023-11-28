@@ -1,151 +1,204 @@
-from dotenv import load_dotenv
 import os
-
-from millify import millify
+import json
+import requests
+import numpy as np
+import pandas as pd
+import streamlit as st
 import plotly.express as px
 import plotly.graph_objects as go
-import streamlit as st
-import pandas as pd
-import numpy as np
-import requests
 
-oad_dotenv()
+from millify import millify
+from dotenv import load_dotenv
+
+load_dotenv()
 PAGE_CONFIG = {"page_title":"Spendings Report","page_icon":":dollar:","layout":"centered"}
 st.set_page_config(**PAGE_CONFIG)
 
 def getdata():
-	DATABASE_ID = os.environ.get('database_id')
-	NOTION_URL = os.environ.get('notion_url')
-	class NotionSync:
-			def __init__(self):
-					pass    
-			def query_databases(self,integration_token=os.environ.get('integration_token'),notion_version=os.environ.get('notion_version')):
-					database_url = NOTION_URL + DATABASE_ID + "/query"
-					response = requests.post(database_url, headers={"Authorization": f"{integration_token}","Notion-Version":f"{notion_version}"})
-					if response.status_code != 200:
-							raise Exception(f'Response Status: {response.status_code} {response.text}')
+	DATABASE_ID = os.environ.get('DATABASE_ID')
+	NOTION_URL = os.environ.get('NOTION_URL')
+	INTEGRATION_TOKEN = os.environ.get('INTEGRATION_TOKEN')
+	NOTION_VERSION = os.environ.get('NOTION_VERSION')
+
+	filters = {}
+	sorts = [{
+			"property": "Date Payment",
+			"direction": "ascending"
+		}
+	]
+
+	class NotionSyncDB:
+		def __init__(self,database_id, integration_token, notion_version, notion_url):
+			self.token = integration_token
+			self.version = notion_version
+			self.database_id = database_id
+			self.notion_url = notion_url
+			self.properties = self.get_database_properties()
+
+		def get_database_properties(self):
+			header = {
+				"Authorization": f"Bearer {self.token}",
+				"Notion-Version":self.version
+			}
+			db_url = f"{self.notion_url}{self.database_id}"
+			response = requests.get(db_url, headers=header)
+			if response.status_code != 200:
+				raise Exception(f'Response Status: {response.status_code} {response.text}')
+			else:
+				return response.json()['properties']
+
+		def query_database(self, query_filter,query_sort, stored_data=None):
+			query_url = f"{self.notion_url}{self.database_id}/query"
+			params = {
+				"sorts":query_sort,
+			}
+			header = {
+				"Authorization": f"Bearer {self.token}", 
+				"Content-Type": "application/json", 
+				"Notion-Version":self.version
+			}
+			if query_filter:
+				params['filter'] = query_filter
+			
+			response = requests.post(query_url, headers=header, json=params)
+			if response.status_code != 200:
+				raise Exception(f'Response Status: {response.status_code} {response.text}')
+			else:
+				json_data = response.json()
+				data = [self.process_db_data(x) for x in json_data['results']]
+				while json_data['has_more']:
+					cur = json_data['next_cursor']
+					params['start_cursor'] = cur
+					response = requests.post(query_url, headers=header, json=params)
+					json_data = response.json()
+					processed_data = [self.process_db_data(x) for x in json_data['results']]
+					data += processed_data
+			if stored_data:
+				data = stored_data + data
+			with open("expense_data.json",'w') as f:
+				f.write(json.dumps(data))
+			return data
+
+		def process_db_data(self,row):
+			properties = self.properties.keys()
+			res_data = {}
+			row = row['properties']
+			for prop in properties:
+				try:
+					prop_val = row[prop]
+					prop_type = prop_val['type']
+					if prop_type in ['number', 'created_time']:
+						temp_data = prop_val[prop_type]
+					elif prop_type in ['rich_text','title']:
+						temp_data = " ".join([text['plain_text'] for text in prop_val[prop_type]])
+					elif prop_type == 'select':
+						temp_data = prop_val['select']['name']
+					elif prop_type == 'formula':
+						formula_type = prop_val['formula']['type']
+						if formula_type in ['number','string']:
+							temp_data = prop_val['formula'][formula_type]
+						elif formula_type in ['date']:
+							temp_data = prop_val['formula'][formula_type]['start']
 					else:
-							data = [response.json()]
-							while response.json()['has_more']:
-								cur = response.json()['next_cursor']
-								response = requests.post(database_url, json={'start_cursor':cur}, headers={"Authorization": f"{integration_token}","Notion-Version":f"{notion_version}"})
-								# print(response.json())
-								data.append(response.json())
-							return data
-			def get_projects_titles(self,data_json):
-					return list(data_json["results"][0]["properties"].keys())
-			def get_projects_data(self,data_json,projects):
-					data = []
-					for i in data_json:
-						res = i["results"]
-						for val in res:
-							row = []
-							el = val['properties']
-							for p in projects:
-								tipe = el[p]['type']
-								# print(tipe)
-								# pprint.PrettyPrinter(indent=4).pprint(el[p][tipe])
-								if tipe == 'formula':
-									key = el[p][tipe]['type']
-									if key == 'date':
-										row.append(el[p][tipe][key]['start'])
-									else:
-										row.append(el[p][tipe][key])
-								elif tipe =='title':
-									row.append(el[p][tipe][0]['plain_text'])
-								elif tipe =='select':
-									# print(el[p][tipe])
-									row.append(el[p][tipe]['name'])
-								elif tipe == 'rich_text':
-									# print(el[p][tipe])
-									row.append(el[p][tipe][0]['text']['content'])
-								else:
-									row.append(el[p][tipe])
-							data.append(row)
-					return data
-	nsync = NotionSync()
-	data = nsync.query_databases()
-	projects = nsync.get_projects_titles(data[0])
-	data = nsync.get_projects_data(data,projects)
-	money_df = pd.DataFrame(data, columns = projects)
+						raise Exception(f'Properties Type not found: {prop}')
+					res_data[prop] = temp_data
+				except Exception as e:
+					print(e,row)
+			return res_data
+
+	expense_db = NotionSyncDB(database_id=DATABASE_ID, integration_token=INTEGRATION_TOKEN, 
+							notion_version=NOTION_VERSION, notion_url=NOTION_URL)
+	stored_data=None
+	if os.path.isfile("expense_data.json"):
+		with open("expense_data.json",'r') as f:
+			stored_data = json.load(f)
+	latest_date = stored_data[-1]['Created At']
+	filters = {
+		"property": "Created At",
+		"date": {
+		"after": latest_date
+		}
+	}
+	data = expense_db.query_database(query_filter=filters,query_sort=sorts,stored_data=stored_data)
+	money_df = pd.DataFrame(data, columns = expense_db.properties.keys())
 	return money_df
 
 def main():
 	money_df = getdata()
-	money_df['Date'] = pd.to_datetime(money_df['Date'],format='%Y-%m-%dT%H:%M:%S.%f%z')
+	money_df['Date Payment'] = pd.to_datetime(money_df['Date Payment'],format='%Y-%m-%dT%H:%M:%S.%f%z')
 	st.title("My Spendings Report")
 	menu = ["Monthly Spendings","All Time Spendings"]
 	choice = st.selectbox('Menu',menu)
- 	
+
 	#All time report
 	if choice == menu[1]:
 		st.header("All Time Spendings")
-		most_spend_cat = money_df[money_df['method']=='cash'].groupby('Category').sum().sort_values('price',ascending=False).iloc[0]
+		most_spend_cat = money_df[money_df['Payment']=='cash'][['Category','Price in Number']].groupby('Category').sum().sort_values('Price in Number',ascending=False).iloc[0]
 
 		st.subheader('Metrics')
 		col1 = st.columns(2)
 		col1[0].metric(label='Total Spendings',
-							value=millify(money_df[money_df['method']=='cash']['price'].sum(), precision=2))
+							value=millify(money_df[money_df['Payment']=='cash']['Price in Number'].sum(), precision=2))
 		col1[1].metric(label='Highest Spending Category',
 							value=most_spend_cat.name.capitalize(),
-							delta=millify(most_spend_cat.price, precision=2),
+							delta=millify(most_spend_cat['Price in Number'], precision=2),
 							delta_color='off')
 
 		st.subheader('Spendings per Category')
-		fig = px.bar(money_df[money_df['method']=='cash'].groupby('Category')['price'].sum().reset_index(),
-								x='Category',y='price',text_auto=True,
-								labels={'price':'Total Spendings'})
+		fig = px.bar(money_df[money_df['Payment']=='cash'].groupby('Category')['Price in Number'].sum().reset_index(),
+								x='Category',y='Price in Number',text_auto=True,
+								labels={'Price in Number':'Total Spendings'})
 		fig.update_layout(xaxis={'categoryorder':'total ascending'})
 		st.plotly_chart(fig, use_container_width=True)
 
 		st.subheader('Spendings per Method')
-		fig = px.bar(money_df.groupby('method')['price'].sum().reset_index(),
-								x='method',y='price',text_auto=True,
-								labels={'price':'Total Spendings'})
+		fig = px.bar(money_df.groupby('Payment')['Price in Number'].sum().reset_index(),
+								x='Payment',y='Price in Number',text_auto=True,
+								labels={'Price in Number':'Total Spendings'})
 		fig.update_layout(xaxis={'categoryorder':'total ascending'})
 		st.plotly_chart(fig, use_container_width=True)
 
 		st.subheader('Spending Trends')
-		fig = px.line(money_df[money_df['method']=='cash'].groupby(pd.Grouper(key='Date',freq='M'))['price'].sum().reset_index(), 
-								x="Date", y="price", 
-								labels={'price':'Total Spendings'})
+		fig = px.line(money_df[money_df['Payment']=='cash'].groupby(pd.Grouper(key='Date Payment',freq='M'))['Price in Number'].sum().reset_index(), 
+								x="Date Payment", y="Price in Number", 
+								labels={'Price in Number':'Total Spendings'})
 		st.plotly_chart(fig, use_container_width=True)
 	#Monthly Report
 	elif choice == menu[0]:
 		curr = pd.Timestamp.now()
 		last_month = curr.replace(day=1) - pd.Timedelta(days=1)
-		df = money_df.loc[money_df['Date'].dt.to_period(freq='M')== curr.to_period(freq='M') ].reset_index()
-		last_month_df =  money_df.loc[money_df['Date'].dt.to_period(freq='M')== last_month.to_period(freq='M') ].reset_index()
-		most_spend_cat = df[df['method']=='cash'].groupby('Category').sum().sort_values('price',ascending=False).iloc[0]
+		df = money_df.loc[money_df['Date Payment'].dt.to_period(freq='M')== curr.to_period(freq='M') ].reset_index()
+		last_month_df =  money_df.loc[money_df['Date Payment'].dt.to_period(freq='M')== last_month.to_period(freq='M') ].reset_index()
+		most_spend_cat = df[df['Payment']=='cash'][['Category','Price in Number']].groupby('Category').sum().sort_values('Price in Number',ascending=False).iloc[0]
 
 		st.header(f"Monthly Spendings {curr.strftime('%b %Y')}")
 
 		st.subheader('Metrics')
 		col1 = st.columns([1,1,2])
 		col1[0].metric(label='This Month Spendings',
-							value=millify(df[df['method']=='cash']['price'].sum(), precision=2),
-							delta=f"{(df[df['method']=='cash']['price'].sum()-last_month_df[last_month_df['method']=='cash']['price'].sum())/last_month_df[last_month_df['method']=='cash']['price'].sum()*100:.2f}%",
+							value=millify(df[df['Payment']=='cash']['Price in Number'].sum(), precision=2),
+							delta=f"{(df[df['Payment']=='cash']['Price in Number'].sum()-last_month_df[last_month_df['Payment']=='cash']['Price in Number'].sum())/last_month_df[last_month_df['Payment']=='cash']['Price in Number'].sum()*100:.2f}%",
 							delta_color='inverse')
 		col1[1].metric(label='Last Month Spendings',
-							value=millify(last_month_df[last_month_df['method']=='cash']['price'].sum(), precision=2))
+							value=millify(last_month_df[last_month_df['Payment']=='cash']['Price in Number'].sum(), precision=2))
 		col1[2].metric(label='Highest Spending Category',
 							value=most_spend_cat.name.capitalize(),
-							delta=millify(most_spend_cat.price, precision=2),
+							delta=millify(most_spend_cat['Price in Number'], precision=2),
 							delta_color='off')
 		
 		st.subheader('Spendings per Category')
-		fig = px.bar(df[df['method']=='cash'].groupby('Category')['price'].sum().reset_index(),
-								x='Category',y='price',text_auto=True,
-								labels={'price':'Total Spendings'})
+		fig = px.bar(df[df['Payment']=='cash'].groupby('Category')['Price in Number'].sum().reset_index(),
+								x='Category',y='Price in Number',text_auto=True,
+								labels={'Price in Number':'Total Spendings'})
 		fig.update_layout(xaxis={'categoryorder':'total ascending'})
 		st.plotly_chart(fig, use_container_width=True)
 
 		st.subheader('Spending Trends')
-		fig = px.line(df[df['method']=='cash'].groupby(pd.Grouper(key='Date',freq=('D')))['price'].sum().reset_index().sort_values('Date'), 
-								x="Date", y="price", 
-								labels={'price':'Total Spendings'})
+		fig = px.line(df[df['Payment']=='cash'].groupby(pd.Grouper(key='Date Payment',freq=('D')))['Price in Number'].sum().reset_index().sort_values('Date Payment'), 
+								x="Date Payment", y="Price in Number", 
+								labels={'Price in Number':'Total Spendings'})
 		st.plotly_chart(fig, use_container_width=True)
-		#st.dataframe(df[['Name','price','method','Category','Date']])
+		#st.dataframe(df[['Name','price','Payment','Category','Date Payment']])
 	
 if __name__ == '__main__':
 	main()
